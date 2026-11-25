@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <title>贷款记账</title>
+  <meta name="theme-color" content="#0f9d8a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="贷款记账" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn hidden" id="backBtn" data-action="back" aria-label="返回">‹</button>
+    <h1 id="title">贷款记账</h1>
+    <button class="icon-btn" id="addBtn" data-action="quick-add" aria-label="记一笔">＋</button>
+  </header>
+
+  <main id="view"></main>
+
+  <nav class="tabbar">
+    <button data-tab="home" class="active"><span class="ti">◎</span><span>总览</span></button>
+    <button data-tab="loans"><span class="ti">☰</span><span>贷款</span></button>
+    <button data-tab="settings"><span class="ti">⚙︎</span><span>备份/设置</span></button>
+  </nav>
+
+  <div id="sheetMask" class="mask hidden"></div>
+  <section id="sheet" class="sheet hidden" role="dialog" aria-modal="true">
+    <div class="sheet-head">
+      <button class="link" data-action="close-sheet">取消</button>
+      <h2 id="sheetTitle"></h2>
+      <button class="link strong" id="sheetOk">保存</button>
+    </div>
+    <form id="sheetBody" class="sheet-body" autocomplete="off"></form>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+  <input type="file" id="importFile" accept=".json,application/json" class="hidden" />
+
+  <script src="app.js"></script>
+</body>
+</html>
