@@ -1,5 +1,5 @@
 // 离线缓存：首次打开后，没有网络也能使用
-const CACHE = 'loan-ledger-v3';
+const CACHE = 'loan-ledger-v5';
 const ASSETS = [
   './',
   './index.html',

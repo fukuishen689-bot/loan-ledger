@@ -53,9 +53,15 @@ function addMonths(startIso, k, day) {
   const last = new Date(y, m + 1, 0).getDate();
   return isoOf(new Date(y, m, Math.min(day || s.getDate(), last)));
 }
+function daysBetween(aIso, bIso) {
+  return Math.round((parseDate(bIso) - parseDate(aIso)) / 86400000);
+}
+function monthsBetween(aIso, bIso) {
+  const a = parseDate(aIso), b = parseDate(bIso);
+  return Math.max(0, (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth()) + (b.getDate() >= a.getDate() ? 0 : -1));
+}
 function daysUntil(iso) {
-  const t = parseDate(todayIso());
-  return Math.round((parseDate(iso) - t) / 86400000);
+  return daysBetween(todayIso(), iso);
 }
 const cnDate = (iso) => { const d = parseDate(iso); return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`; };
 const shortDate = (iso) => { const d = parseDate(iso); return `${d.getMonth() + 1}/${d.getDate()}`; };
@@ -67,33 +73,86 @@ function dueText(days) {
 }
 
 /* ================= 计算 ================= */
-// 根据「建账时的剩余本金」和「剩余期数」生成接下来的还款计划
-function schedule(loan) {
-  const P = round2((Number(loan.principal) || 0) - (Number(loan.repaidBefore) || 0));
-  const n = parseInt(loan.termMonths, 10) || 0;
-  const r = (Number(loan.rate) || 0) / 100 / 12;
-  if (loan.method === 'none' || !n || P <= 0) return [];
-  const hasNext = Boolean(loan.nextPayDate);
-  const baseDate = hasNext ? loan.nextPayDate : (loan.startDate || todayIso());
-  const day = hasNext
-    ? parseDate(loan.nextPayDate).getDate()
-    : (parseInt(loan.payDay, 10) || parseDate(baseDate).getDate());
+// 通用分期计算（用于完整期数反推以前已还本金/利息，或用于生成剩余还款计划）
+function buildPlan(P, rate, n, method, firstDate) {
+  P = round2(P);
+  n = parseInt(n, 10) || 0;
+  const r = (Number(rate) || 0) / 100 / 12;
+  if (method === 'none' || !n || P <= 0) return [];
+  const day = firstDate ? parseDate(firstDate).getDate() : 1;
   const pmt = r ? (P * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1) : P / n;
   const out = [];
   let bal = P;
   for (let i = 1; i <= n; i++) {
     let interest = bal * r;
     let principal;
-    if (loan.method === 'equal_installment') principal = i === n ? bal : pmt - interest;
-    else if (loan.method === 'equal_principal') principal = i === n ? bal : P / n;
+    if (method === 'equal_installment') principal = i === n ? bal : pmt - interest;
+    else if (method === 'equal_principal') principal = i === n ? bal : P / n;
     else principal = i === n ? bal : 0; // 先息后本
     interest = round2(interest);
     principal = round2(principal);
     bal = round2(bal - principal);
-    const date = hasNext ? addMonths(baseDate, i - 1, day) : addMonths(baseDate, i, day);
+    const date = firstDate ? addMonths(firstDate, i - 1, day) : '';
     out.push({ n: i, date, payment: round2(principal + interest), principal, interest, balance: Math.max(0, bal) });
   }
   return out;
+}
+
+// 根据「建账时的剩余本金」和「剩余期数」生成接下来的还款计划
+function schedule(loan) {
+  const P = round2((Number(loan.principal) || 0) - (Number(loan.repaidBefore) || 0));
+  const n = parseInt(loan.termMonths, 10) || 0;
+  if (loan.method === 'none' || !n || P <= 0) return [];
+  const pm = Math.max(0, parseInt(loan.paidMonths, 10) || 0);
+  const firstDate = loan.nextPayDate
+    ? loan.nextPayDate
+    : loan.startDate
+      ? addMonths(loan.startDate, pm + 1, parseInt(loan.payDay, 10) || parseDate(loan.startDate).getDate())
+      : addMonths(todayIso(), 1);
+  return buildPlan(P, loan.rate, n, loan.method, firstDate);
+}
+
+// 根据首次贷款金额、利率、已还期数和剩余期数，自动推算建账前的已还本金和已付利息
+function estimatePast(loan) {
+  const P = round2(loan.principal);
+  const rate = Number(loan.rate) || 0;
+  const pm = Math.max(0, parseInt(loan.paidMonths, 10) || 0);
+  const rm = Math.max(0, parseInt(loan.termMonths, 10) || 0);
+  if (P <= 0) return { principalPaid: 0, interestPaid: 0, pastMonths: pm };
+
+  // 有固定计划且填了已还期数：按完整总期数精确算出前 pm 期的本金与利息
+  if (loan.method !== 'none' && pm > 0 && pm + rm > 0) {
+    const full = buildPlan(P, rate, pm + rm, loan.method, '');
+    const past = full.slice(0, pm);
+    return {
+      principalPaid: round2(past.reduce((a, x) => a + x.principal, 0)),
+      interestPaid: round2(past.reduce((a, x) => a + x.interest, 0)),
+      pastMonths: pm
+    };
+  }
+  // 无已还期数但有已还本金和利率：按原公式反推
+  const rb = round2(loan.repaidBefore);
+  const B = round2(Math.max(0, P - rb));
+  const r = rate / 100 / 12;
+  if (rate > 0 && loan.method === 'equal_installment' && rb > 0 && B > 0 && rm > 0) {
+    const pmt = (B * r * Math.pow(1 + r, rm)) / (Math.pow(1 + r, rm) - 1);
+    if (pmt > P * r) {
+      const totalN = Math.round(Math.log(pmt / (pmt - P * r)) / Math.log(1 + r));
+      const pastN = Math.max(0, totalN - rm);
+      if (pastN > 0) return { principalPaid: rb, interestPaid: round2(Math.max(0, pmt * pastN - rb)), pastMonths: pastN };
+    }
+  }
+  if (rate > 0 && loan.method === 'equal_principal' && rb > 0 && B > 0 && rm > 0) {
+    const mp = B / rm;
+    const pastN = Math.round(rb / mp);
+    if (pastN > 0) return { principalPaid: rb, interestPaid: round2(pastN * ((P + B + mp) / 2) * r), pastMonths: pastN };
+  }
+  if (rate > 0 && loan.startDate) {
+    const days = Math.max(0, daysBetween(loan.startDate, todayIso()));
+    const avgBal = rb > 0 ? (P + B) / 2 : P;
+    return { principalPaid: rb, interestPaid: round2(avgBal * (rate / 100) * (days / 365)), pastMonths: pm || Math.round(days / 30) };
+  }
+  return { principalPaid: rb, interestPaid: 0, pastMonths: pm };
 }
 
 function recordsOf(loanId) {
@@ -116,7 +175,11 @@ function stats(loan) {
   const repaidBefore = round2(loan.repaidBefore);
   const plan = schedule(loan);
   const planBase = round2(Math.max(0, (Number(loan.principal) || 0) - repaidBefore));
-  const repaid = round2(repaidBefore + repaidRecords);
+  const est = estimatePast(loan);
+  const pastInterest = loan.pastInterest !== '' && loan.pastInterest != null ? round2(loan.pastInterest) : est.interestPaid;
+  const basePaidMonths = Math.max(0, parseInt(loan.paidMonths, 10) || 0);
+
+  const repaid = round2(repaidBefore + pastInterest + repaidRecords);
   const total = round2((Number(loan.principal) || 0) + borrowed);
   const principalRepaid = round2(repaidBefore + repaidRecords - interestPaid);
   const remaining = round2(total - principalRepaid);
@@ -128,12 +191,19 @@ function stats(loan) {
   }
   const planTotal = round2(plan.reduce((a, p) => a + p.payment, 0));
   const planInterest = round2(plan.reduce((a, p) => a + p.interest, 0));
+  const unpaidInterest = remaining <= 0.009 ? 0 : round2(plan.slice(paidPeriods).reduce((a, p) => a + p.interest, 0));
+  const paidInterestTotal = round2(pastInterest + interestPaid);
+  const totalInterest = round2(paidInterestTotal + unpaidInterest);
+  const remainingWithInterest = round2(remaining + unpaidInterest);
+  const totalPaidPeriods = basePaidMonths + paidPeriods;
+  const remainingPeriods = Math.max(0, plan.length - paidPeriods);
+  const totalPeriods = basePaidMonths + plan.length;
 
   let next = null;
   if (remaining > 0.009) {
     if (plan.length && paidPeriods < plan.length) {
       const p = plan[paidPeriods];
-      next = { date: p.date, amount: round2(cum + p.payment - repaidRecords), n: p.n };
+      next = { date: p.date, amount: round2(cum + p.payment - repaidRecords), n: basePaidMonths + p.n };
     } else if (!plan.length && loan.nextPayDate) {
       let iso = loan.nextPayDate;
       const day = parseDate(iso).getDate();
@@ -153,19 +223,23 @@ function stats(loan) {
   }
   return {
     borrowed: round2(borrowed), repaid, repaidBefore, repaidRecords: round2(repaidRecords),
-    interestPaid: round2(interestPaid), total, principalRepaid, remaining,
-    plan, planBase, paidPeriods, next, planTotal, planInterest,
+    interestPaid: round2(interestPaid), pastInterest, unpaidInterest, paidInterestTotal, totalInterest, remainingWithInterest,
+    basePaidMonths, paidPeriods, totalPaidPeriods, remainingPeriods, totalPeriods,
+    total, principalRepaid, remaining, plan, planBase, next, planTotal, planInterest,
     progress: total > 0 ? Math.min(1, Math.max(0, principalRepaid / total)) : 0
   };
 }
 
 function totals() {
-  const t = { principal: 0, borrowed: 0, repaid: 0, repaidBefore: 0, total: 0, remaining: 0, interestPaid: 0, principalRepaid: 0 };
+  const t = { principal: 0, borrowed: 0, repaid: 0, repaidBefore: 0, total: 0, remaining: 0, interestPaid: 0, pastInterest: 0, paidInterestTotal: 0, unpaidInterest: 0, totalInterest: 0, remainingWithInterest: 0, principalRepaid: 0 };
   for (const l of state.loans) {
     const s = stats(l);
     t.principal += Number(l.principal) || 0;
     t.borrowed += s.borrowed; t.repaid += s.repaid; t.repaidBefore += s.repaidBefore;
-    t.total += s.total; t.remaining += s.remaining; t.interestPaid += s.interestPaid; t.principalRepaid += s.principalRepaid;
+    t.total += s.total; t.remaining += s.remaining; t.interestPaid += s.interestPaid;
+    t.pastInterest += s.pastInterest; t.paidInterestTotal += s.paidInterestTotal;
+    t.unpaidInterest += s.unpaidInterest; t.totalInterest += s.totalInterest;
+    t.remainingWithInterest += s.remainingWithInterest; t.principalRepaid += s.principalRepaid;
   }
   Object.keys(t).forEach((k) => (t[k] = round2(t[k])));
   t.progress = t.total > 0 ? Math.min(1, Math.max(0, t.principalRepaid / t.total)) : 0;
@@ -233,17 +307,23 @@ function renderHome() {
   viewEl.innerHTML = `
     ${installHint()}
     <div class="card hero">
-      <div class="label">剩余未还（本金）</div>
+      <div class="label">现在还剩（本金）</div>
       <div class="big">${fmt(t.remaining)}</div>
       <div class="progress"><i style="width:${(t.progress * 100).toFixed(1)}%"></i></div>
-      <div class="meta">已还本金 ${(t.progress * 100).toFixed(1)}% · 共 ${state.loans.length} 笔贷款</div>
+      <div class="meta">已还本金 ${(t.progress * 100).toFixed(1)}% · 共 ${state.loans.length} 笔贷款${t.unpaidInterest ? ` · 含息待还 ${fmt(t.remainingWithInterest)}` : ''}</div>
     </div>
     <div class="grid3">
       <div class="stat blue"><div class="k">贷款金额</div><div class="v">${fmt(t.total)}</div></div>
       <div class="stat green"><div class="k">已还金额</div><div class="v">${fmt(t.repaid)}</div></div>
       <div class="stat orange"><div class="k">新借金额</div><div class="v">${fmt(t.borrowed)}</div></div>
     </div>
-    <div class="note" style="margin:6px 4px">贷款金额 = 初始借款 ${fmt(t.principal)} + 新借 ${fmt(t.borrowed)}${t.repaidBefore ? `；已还中含以前已还 ${fmt(t.repaidBefore)}` : ''}${t.interestPaid ? `，后续利息 ${fmt(t.interestPaid)}` : ''}</div>
+    ${t.totalInterest > 0 ? `
+    <div class="grid3" style="margin-top:8px">
+      <div class="stat"><div class="k">已付利息总额</div><div class="v">${fmt(t.paidInterestTotal)}</div></div>
+      <div class="stat orange"><div class="k">剩余利息总额</div><div class="v">${fmt(t.unpaidInterest)}</div></div>
+      <div class="stat red"><div class="k">利息合计</div><div class="v">${fmt(t.totalInterest)}</div></div>
+    </div>` : ''}
+    <div class="note" style="margin:6px 4px">贷款金额 = 初始借款 ${fmt(t.principal)} + 新借 ${fmt(t.borrowed)}${t.repaidBefore ? `；已还中含以前已还 ${fmt(t.repaidBefore)}` : ''}${t.pastInterest ? `；已付利息含按利率估算的以前利息 ${fmt(t.pastInterest)}` : ''}</div>
     ${reminderHtml()}
     <div class="btns">
       <button class="btn primary" data-action="add-record" data-type="repay">记一笔还款</button>
@@ -286,7 +366,7 @@ function renderLoans() {
         <div class="s">${esc([l.lender, METHODS[l.method] || '', l.rate ? `年利率 ${l.rate}%` : ''].filter(Boolean).join(' · '))}</div>
         <div class="mini-bar"><i style="width:${(s.progress * 100).toFixed(1)}%"></i></div>
       </div>
-      <div class="r"><div class="amt">${fmt(s.remaining)}</div><div class="s">剩余 / 共 ${fmt(s.total)}</div></div>
+      <div class="r"><div class="amt">${fmt(s.remaining)}</div><div class="s">剩本金${s.unpaidInterest ? ` · 息 ${fmt(s.unpaidInterest)}` : ` / 共 ${fmt(s.total)}`}</div></div>
       <span class="chev">›</span>
     </div>`;
   }).join('');
@@ -304,12 +384,12 @@ function renderLoan() {
 
   const planHtml = s.plan.length ? `
     <div class="card">
-      <h3>接下来怎么还 <span class="note">${METHODS[loan.method]} · 剩 ${s.plan.length} 期</span></h3>
-      <div class="note" style="margin-bottom:8px">按剩余 ${fmt(s.planBase)} 计算：后续总还款 ${fmt(s.planTotal)}，其中利息 ${fmt(s.planInterest)}。后续已还 ${s.paidPeriods}/${s.plan.length} 期。</div>
+      <h3>接下来怎么还 <span class="note">${METHODS[loan.method]} · 剩 ${s.remainingPeriods} 期</span></h3>
+      <div class="note" style="margin-bottom:8px">已还 ${s.totalPaidPeriods} 期 / 共 ${s.totalPeriods} 期 · 剩余期数 ${s.remainingPeriods} 期<br/>后续总还款 ${fmt(s.planTotal)}，其中剩余利息 ${fmt(s.unpaidInterest)}。</div>
       <div class="scroll-x"><table class="plan">
         <thead><tr><th>期/日期</th><th>月供</th><th>本金</th><th>利息</th><th>剩余</th></tr></thead>
         <tbody>${s.plan.map((p, i) => `<tr class="${i < s.paidPeriods ? 'paid' : i === s.paidPeriods ? 'next' : ''}">
-          <td>${p.n} · ${p.date.slice(2).replace(/-/g, '/')}</td><td>${p.payment.toFixed(2)}</td><td>${p.principal.toFixed(2)}</td><td>${p.interest.toFixed(2)}</td><td>${p.balance.toFixed(2)}</td></tr>`).join('')}</tbody>
+          <td>${s.basePaidMonths + p.n} · ${p.date.slice(2).replace(/-/g, '/')}</td><td>${p.payment.toFixed(2)}</td><td>${p.principal.toFixed(2)}</td><td>${p.interest.toFixed(2)}</td><td>${p.balance.toFixed(2)}</td></tr>`).join('')}</tbody>
       </table></div>
     </div>` : '';
 
@@ -318,14 +398,25 @@ function renderLoan() {
       <div class="label">现在还剩（本金）${loan.lender ? ' · ' + esc(loan.lender) : ''}</div>
       <div class="big">${fmt(s.remaining)}</div>
       <div class="progress"><i style="width:${(s.progress * 100).toFixed(1)}%"></i></div>
-      <div class="meta">${s.remaining <= 0.009 ? '🎉 已全部还清' : s.next ? `下次还款：${cnDate(s.next.date)}（${dueText(nextDays)}）${s.next.amount != null ? ' · ' + fmt(s.next.amount) : ''}` : `已还本金 ${(s.progress * 100).toFixed(1)}%`}</div>
+      <div class="meta">${s.remaining <= 0.009 ? '🎉 已全部还清' : s.next ? `下次还款：${cnDate(s.next.date)}（${dueText(nextDays)}）${s.next.amount != null ? ' · ' + fmt(s.next.amount) : ''}` : `已还本金 ${(s.progress * 100).toFixed(1)}%`}${s.unpaidInterest ? `<br/>剩余本息合计 ${fmt(s.remainingWithInterest)}（含剩余利息 ${fmt(s.unpaidInterest)}）` : ''}</div>
     </div>
     <div class="grid3">
       <div class="stat blue"><div class="k">贷款金额</div><div class="v">${fmt(s.total)}</div></div>
       <div class="stat green"><div class="k">已还金额</div><div class="v">${fmt(s.repaid)}</div></div>
       <div class="stat orange"><div class="k">新借金额</div><div class="v">${fmt(s.borrowed)}</div></div>
     </div>
-    <div class="note" style="margin:6px 4px">以前借了 ${fmt(loan.principal)}${loan.startDate ? `（${cnDate(loan.startDate)}）` : ''}${s.repaidBefore ? ` · 以前已还 ${fmt(s.repaidBefore)}` : ''}${s.interestPaid ? ` · 后续已付利息 ${fmt(s.interestPaid)}` : ''}${loan.note ? '<br/>备注：' + esc(loan.note) : ''}</div>
+    <div class="grid3" style="margin-top:8px">
+      <div class="stat"><div class="k">已付利息总额</div><div class="v">${fmt(s.paidInterestTotal)}</div></div>
+      <div class="stat orange"><div class="k">剩余利息总额</div><div class="v">${fmt(s.unpaidInterest)}</div></div>
+      <div class="stat red"><div class="k">利息合计</div><div class="v">${fmt(s.totalInterest)}</div></div>
+    </div>
+    ${s.totalPeriods > 0 ? `
+    <div class="grid3" style="margin-top:8px">
+      <div class="stat"><div class="k">首次贷款时间</div><div class="v" style="font-size:13px">${loan.startDate ? cnDate(loan.startDate) : '未填'}</div></div>
+      <div class="stat green"><div class="k">已还期数</div><div class="v">${s.totalPaidPeriods} 期</div></div>
+      <div class="stat blue"><div class="k">剩余期数</div><div class="v">${s.remainingPeriods} 期</div></div>
+    </div>` : ''}
+    <div class="note" style="margin:6px 4px">首次借款 ${fmt(loan.principal)}${loan.startDate ? `（${cnDate(loan.startDate)}）` : ''}${s.repaidBefore ? ` · 以前已还本金 ${fmt(s.repaidBefore)}` : ''}${s.pastInterest ? ` · 以前已付利息 ${fmt(s.pastInterest)}` : ''}${s.interestPaid ? ` · 后续已付利息 ${fmt(s.interestPaid)}` : ''}${loan.note ? '<br/>备注：' + esc(loan.note) : ''}</div>
     <div class="btns">
       <button class="btn primary" data-action="add-record" data-id="${loan.id}" data-type="repay">记一笔还款</button>
       <button class="btn warn" data-action="add-record" data-id="${loan.id}" data-type="borrow">新借一笔</button>
@@ -364,7 +455,7 @@ function renderSettings() {
     <div class="list">
       <div class="row tap" data-action="clear-all"><div class="main"><div class="t" style="color:var(--red)">清空所有数据</div></div></div>
     </div>
-    <div class="note" style="text-align:center;margin-top:20px">贷款记账 v1.1</div>
+    <div class="note" style="text-align:center;margin-top:20px">贷款记账 v1.3</div>
   `;
   $('#remindDaysInput').addEventListener('change', (e) => {
     state.settings.remindDays = Math.max(0, parseInt(e.target.value, 10) || 0);
@@ -402,42 +493,56 @@ $('#sheetMask').addEventListener('click', closeSheet);
 
 function loanForm(loan) {
   const defaultNext = addMonths(todayIso(), 1);
-  const l = loan || { name: '', lender: '', principal: '', repaidBefore: '', startDate: '', nextPayDate: defaultNext, rate: '', termMonths: '', method: 'equal_installment', remindDays: '', note: '' };
+  const l = loan || { name: '', lender: '', principal: '', startDate: todayIso(), paidMonths: '', termMonths: '', repaidBefore: '', pastInterest: '', nextPayDate: defaultNext, rate: '', method: 'equal_installment', remindDays: '', note: '' };
   const initRem = l.principal !== '' && l.principal != null ? round2(Math.max(0, Number(l.principal) - (Number(l.repaidBefore) || 0))) : '';
+  const initPastInt = l.pastInterest !== '' && l.pastInterest != null ? l.pastInterest : (loan ? estimatePast(l).interestPaid || '' : '');
   openSheet(loan ? '编辑贷款' : '添加贷款', `
     <div class="field"><label>贷款名称 *</label><input name="name" value="${esc(l.name)}" placeholder="例如：房贷、车贷、借小王的钱" required /></div>
     <div class="field"><label>出借方（银行 / 平台 / 个人）</label><input name="lender" value="${esc(l.lender)}" placeholder="例如：招商银行" /></div>
-    <div class="field"><label>以前总共借了多少（贷款金额）*</label><input name="principal" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(l.principal)}" placeholder="0.00" /></div>
-    <div class="two" style="margin-top:10px">
-      <div class="field"><label>以前已还金额</label><input name="repaidBefore" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(l.repaidBefore)}" placeholder="新借款留空" /></div>
-      <div class="field"><label>现在还剩金额</label><input name="remainingNow" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(initRem)}" placeholder="自动计算" /></div>
+    <div class="two">
+      <div class="field"><label>首次贷款金额 *</label><input name="principal" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(l.principal)}" placeholder="0.00" /></div>
+      <div class="field"><label>首次贷款时间</label><input name="startDate" type="date" value="${esc(l.startDate || '')}" /></div>
     </div>
-    <div class="note" style="margin:4px 4px 10px">老借款填「以前已还」或「现在还剩」任意一个，另一个会自动算；之前的明细不用补记。</div>
-    <div class="section-title" style="margin-top:12px">接下来怎么还（选填）</div>
-    <div class="field"><label>还款方式</label><select name="method">
-      ${Object.entries(METHODS).map(([k, v]) => `<option value="${k}" ${l.method === k ? 'selected' : ''}>${v}</option>`).join('')}
-    </select></div>
     <div class="two" style="margin-top:10px">
+      <div class="field"><label>还款方式</label><select name="method">
+        ${Object.entries(METHODS).map(([k, v]) => `<option value="${k}" ${l.method === k ? 'selected' : ''}>${v}</option>`).join('')}
+      </select></div>
       <div class="field"><label>年利率 %</label><input name="rate" type="number" inputmode="decimal" step="0.001" min="0" value="${esc(l.rate)}" placeholder="例如 3.85" /></div>
+    </div>
+    <div class="two" style="margin-top:10px">
+      <div class="field"><label>已还期数（月）</label><input name="paidMonths" type="number" inputmode="numeric" min="0" value="${esc(l.paidMonths)}" placeholder="新借款填 0" /></div>
       <div class="field"><label>剩余期数（月）</label><input name="termMonths" type="number" inputmode="numeric" min="0" value="${esc(l.termMonths)}" placeholder="例如 24" /></div>
     </div>
+    <div class="two" style="margin-top:10px">
+      <div class="field"><label>以前已还本金</label><input name="repaidBefore" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(l.repaidBefore)}" placeholder="自动计算" /></div>
+      <div class="field"><label>现在还剩本金</label><input name="remainingNow" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(initRem)}" placeholder="自动计算" /></div>
+    </div>
+    <div class="two" style="margin-top:10px">
+      <div class="field"><label>已付利息总额</label><input name="pastInterest" type="number" inputmode="decimal" step="0.01" min="0" value="${esc(initPastInt)}" placeholder="自动计算" /></div>
+      <div class="field"><label>剩余利息总额</label><input name="unpaidInterestView" type="text" readonly placeholder="自动计算" /></div>
+    </div>
+    <div class="field"><label>利息合计（已付 + 剩余）</label><input name="totalInterestView" type="text" readonly placeholder="自动计算" />
+      <div class="hint">填完金额、利率、已还期数和剩余期数会自动算好；如果和银行账单有出入，可直接修改「以前已还本金 / 现在还剩本金 / 已付利息总额」。</div></div>
     <div class="two" style="margin-top:10px">
       <div class="field"><label>下次还款日</label><input name="nextPayDate" type="date" value="${esc(l.nextPayDate || '')}" /></div>
       <div class="field"><label>提前几天提醒</label><input name="remindDays" type="number" inputmode="numeric" min="0" max="30" value="${esc(l.remindDays)}" placeholder="默认 ${esc(state.settings.remindDays)}" /></div>
     </div>
     <div class="calc-preview" id="loanPreview"></div>
-    <div class="field" style="margin-top:10px"><label>原始借款日期（选填）</label><input name="startDate" type="date" value="${esc(l.startDate || '')}" /></div>
     <div class="field"><label>备注</label><textarea name="note" rows="2">${esc(l.note)}</textarea></div>
   `, (d) => {
     if (!d.name) return toast('请填写贷款名称');
     const principal = round2(d.principal);
-    if (!(principal > 0)) return toast('请填写贷款金额');
+    if (!(principal > 0)) return toast('请填写首次贷款金额');
     const repaidBefore = d.repaidBefore === '' ? 0 : round2(d.repaidBefore);
-    if (repaidBefore < 0 || repaidBefore > principal) return toast('以前已还金额不能大于贷款金额');
+    if (repaidBefore < 0 || repaidBefore > principal) return toast('以前已还本金不能大于贷款金额');
     const data = {
-      name: d.name, lender: d.lender, principal, repaidBefore: repaidBefore || '',
+      name: d.name, lender: d.lender, principal,
       startDate: d.startDate || '', nextPayDate: d.nextPayDate || '',
-      rate: d.rate === '' ? '' : Number(d.rate), termMonths: d.termMonths === '' ? '' : parseInt(d.termMonths, 10),
+      paidMonths: d.paidMonths === '' ? '' : Math.max(0, parseInt(d.paidMonths, 10) || 0),
+      termMonths: d.termMonths === '' ? '' : Math.max(0, parseInt(d.termMonths, 10) || 0),
+      repaidBefore: repaidBefore || '',
+      pastInterest: d.pastInterest === '' ? '' : Math.max(0, round2(d.pastInterest)),
+      rate: d.rate === '' ? '' : Number(d.rate),
       method: d.method,
       remindDays: d.remindDays === '' ? '' : Math.max(0, parseInt(d.remindDays, 10) || 0), note: d.note
     };
@@ -447,33 +552,81 @@ function loanForm(loan) {
   });
   const form = $('#sheetBody');
   const pEl = form.querySelector('input[name=principal]');
+  const sdEl = form.querySelector('input[name=startDate]');
+  const mEl = form.querySelector('select[name=method]');
+  const rEl = form.querySelector('input[name=rate]');
+  const pmEl = form.querySelector('input[name=paidMonths]');
+  const tmEl = form.querySelector('input[name=termMonths]');
   const rbEl = form.querySelector('input[name=repaidBefore]');
   const remEl = form.querySelector('input[name=remainingNow]');
+  const piEl = form.querySelector('input[name=pastInterest]');
+  const uiEl = form.querySelector('input[name=unpaidInterestView]');
+  const tiEl = form.querySelector('input[name=totalInterestView]');
+  const npEl = form.querySelector('input[name=nextPayDate]');
+  let manualNextDate = Boolean(loan && loan.nextPayDate);
+
   const preview = () => {
     const d = formData();
     const rem = round2(Math.max(0, (Number(d.principal) || 0) - (Number(d.repaidBefore) || 0)));
-    const plan = schedule({ principal: d.principal, repaidBefore: d.repaidBefore, rate: d.rate, termMonths: d.termMonths, method: d.method, nextPayDate: d.nextPayDate, startDate: d.startDate });
+    const draft = { principal: d.principal, repaidBefore: d.repaidBefore, paidMonths: d.paidMonths, rate: d.rate, termMonths: d.termMonths, method: d.method, nextPayDate: d.nextPayDate, startDate: d.startDate };
+    const plan = schedule(draft);
+    const unpaidInt = round2(plan.reduce((a, p) => a + p.interest, 0));
+    const paidInt = d.pastInterest === '' ? estimatePast(draft).interestPaid : round2(d.pastInterest);
+    const totalInt = round2(paidInt + unpaidInt);
+    uiEl.value = unpaidInt > 0 ? fmt(unpaidInt) : '¥0.00';
+    tiEl.value = totalInt > 0 ? fmt(totalInt) : '¥0.00';
+
     const el = $('#loanPreview');
     if (!el) return;
-    if (!plan.length) { el.textContent = d.method === 'none' ? '无固定计划：只记录剩余金额和后续还款，不计算月供。' : '填写剩余期数和利率后，会按「现在还剩金额」自动计算接下来每月还多少。'; return; }
-    const total = plan.reduce((a, p) => a + p.payment, 0), interest = plan.reduce((a, p) => a + p.interest, 0);
+    if (!plan.length) {
+      el.innerHTML = paidInt > 0
+        ? `已付利息总额 <b>${fmt(paidInt)}</b>。`
+        : d.method === 'none'
+          ? '无固定计划：填「年利率」和「首次贷款时间」可自动估算已付利息。'
+          : '填写贷款金额、年利率、已还期数和剩余期数，会自动算出月供和全部利息。';
+      return;
+    }
     el.innerHTML = d.method === 'equal_principal'
-      ? `按剩余 ${fmt(rem)} 计算：下月还 <b>${fmt(plan[0].payment)}</b>，每月递减；后续利息 ${fmt(interest)}`
+      ? `按剩余 ${fmt(rem)} 分 ${plan.length} 期：下月还 <b>${fmt(plan[0].payment)}</b>（每月递减）`
       : d.method === 'interest_first'
-        ? `按剩余 ${fmt(rem)} 计算：每月付息 <b>${fmt(plan[0].payment)}</b>，最后一期还本金；后续利息 ${fmt(interest)}`
-        : `按剩余 ${fmt(rem)} 计算：接下来每月还 <b>${fmt(plan[0].payment)}</b>；后续利息 ${fmt(interest)}，后续总还 ${fmt(total)}`;
+        ? `按剩余 ${fmt(rem)} 分 ${plan.length} 期：每月付息 <b>${fmt(plan[0].payment)}</b>，最后一期还本金`
+        : `按剩余 ${fmt(rem)} 分 ${plan.length} 期：接下来每月还 <b>${fmt(plan[0].payment)}</b>`;
+  };
+  const recalcFromSchedule = () => {
+    const d = formData();
+    const p = round2(d.principal);
+    if (!(p > 0)) return;
+    const est = estimatePast({ principal: p, rate: d.rate, paidMonths: d.paidMonths, termMonths: d.termMonths, method: d.method, startDate: d.startDate, repaidBefore: d.repaidBefore });
+    if ((parseInt(d.paidMonths, 10) || 0) > 0 && d.method !== 'none') {
+      rbEl.value = est.principalPaid;
+      remEl.value = round2(Math.max(0, p - est.principalPaid));
+      piEl.value = est.interestPaid;
+    } else {
+      const rb = Number(rbEl.value) || 0;
+      remEl.value = round2(Math.max(0, p - rb));
+      piEl.value = est.interestPaid || '';
+    }
+    if (!manualNextDate && d.startDate) {
+      const pm = Math.max(0, parseInt(d.paidMonths, 10) || 0);
+      npEl.value = addMonths(d.startDate, pm + 1);
+    }
   };
   form.oninput = (e) => {
+    const t = e.target;
     const p = Number(pEl.value) || 0;
-    if (e.target === remEl) {
+    if (t === npEl) manualNextDate = true;
+    else if (t === remEl) {
       const rem = Number(remEl.value);
       rbEl.value = remEl.value === '' ? '' : Math.max(0, round2(p - (isNaN(rem) ? 0 : rem)));
-    } else if (e.target === pEl || e.target === rbEl) {
+    } else if (t === rbEl) {
       const rb = Number(rbEl.value) || 0;
       remEl.value = pEl.value === '' ? '' : Math.max(0, round2(p - rb));
+    } else if (t === pEl || t === sdEl || t === mEl || t === rEl || t === pmEl || t === tmEl) {
+      recalcFromSchedule();
     }
     preview();
   };
+  form.onchange = form.oninput;
   preview();
 }
 
@@ -548,9 +701,10 @@ function exportCsv() {
   const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const lines = [['贷款名称', '出借方', '类型', '金额', '其中利息', '日期', '备注'].join(',')];
   for (const l of state.loans) {
-    lines.push([l.name, l.lender, '初始贷款', l.principal, '', l.startDate || '', l.note].map(q).join(','));
-    if (Number(l.repaidBefore) > 0) {
-      lines.push([l.name, l.lender, '以前已还', l.repaidBefore, '', '', '建账前累计已还'].map(q).join(','));
+    const s = stats(l);
+    lines.push([l.name, l.lender, '首次贷款', l.principal, '', l.startDate || '', l.note].map(q).join(','));
+    if (s.repaidBefore > 0 || s.pastInterest > 0) {
+      lines.push([l.name, l.lender, '以前已还', round2(s.repaidBefore + s.pastInterest), s.pastInterest || '', '', `建账前已还 ${s.basePaidMonths} 期`].map(q).join(','));
     }
     for (const r of [...recordsOf(l.id)].reverse()) {
       lines.push([l.name, l.lender, r.type === 'borrow' ? '新借' : '还款', r.amount, r.type === 'borrow' ? '' : r.interest || '', r.date, r.note].map(q).join(','));

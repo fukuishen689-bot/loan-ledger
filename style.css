@@ -90,6 +90,7 @@ main { padding: 4px 14px calc(var(--safe-bottom) + 84px); max-width: 640px; marg
 .stat.blue .v { color: var(--blue); }
 .stat.green .v { color: var(--brand); }
 .stat.orange .v { color: var(--orange); }
+.stat.red .v { color: var(--red); }
 
 /* 列表 */
 .list { background: var(--card); border-radius: var(--radius); overflow: hidden; margin: 10px 0; }
